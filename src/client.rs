@@ -5,8 +5,8 @@ use anyhow::{anyhow, Error, Result};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpSocket, TcpStream};
-use tokio::time::timeout;
 use tokio::time::Duration;
+use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::trace;
 
@@ -30,8 +30,8 @@ pub struct Client {
     will: Option<Will>,
 }
 
-pub struct MQTTOptions<'a> {
-    address: &'a str,
+pub struct MQTTOptions {
+    address: SocketAddr,
     client_id: Option<MqttString>,
     keep_alive: Option<u16>,
     timeout: Option<Duration>,
@@ -58,20 +58,7 @@ pub struct Subscriber<'a> {
     client: &'a mut Client,
 }
 
-impl<'a> Client {
-    pub fn builder(address: &'a str) -> MQTTOptions {
-        MQTTOptions {
-            address,
-            client_id: None,
-            keep_alive: None,
-            timeout: None,
-            properties_builder: PropertiesBuilder::default(),
-            username: None,
-            password: None,
-            will: None,
-        }
-    }
-
+impl Client {
     pub async fn connect(&mut self, clean_start: bool) -> Result<ConnAck> {
         let connect = Connect {
             reserved: false,
@@ -254,11 +241,11 @@ impl<'a> Client {
 
 impl fmt::Display for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.stream.get_ref().local_addr()?)
+        write!(f, "{}", self.stream.get_ref().local_addr().map_err(|_| fmt::Error)?)
     }
 }
 
-impl MQTTOptions<'_> {
+impl MQTTOptions {
     pub fn client_id(mut self, value: &'static str) -> Self {
         self.client_id = Some(MqttString::from(value));
         self
@@ -279,6 +266,13 @@ impl MQTTOptions<'_> {
 
     pub fn receive_maximum(mut self, value: u16) -> Self {
         self.properties_builder = self.properties_builder.receive_maximum(value).unwrap();
+        self
+    }
+
+    pub fn content_type(mut self, value: &'static str) -> Self {
+        self.properties_builder = self.properties_builder.content_type(Some(MqttString::from
+            (value)))
+            .unwrap();
         self
     }
 
@@ -310,14 +304,13 @@ impl MQTTOptions<'_> {
     }
 
     pub async fn connect(self) -> Result<Client> {
-        let peer: SocketAddr = self.address.parse()?;
-        let socket = if peer.is_ipv4() {
+        let socket = if self.address.is_ipv4() {
             TcpSocket::new_v4()?
         } else {
             TcpSocket::new_v6()?
         };
 
-        let stream = socket.connect(peer).await?;
+        let stream = socket.connect(self.address).await?;
         let stream = Framed::new(stream, MqttCodec::new(None));
 
         Ok(Client {
@@ -331,6 +324,18 @@ impl MQTTOptions<'_> {
             password: self.password,
             will: self.will,
         })
+    }
+    pub fn new(address: SocketAddr) -> Self {
+        MQTTOptions {
+            address,
+            client_id: None,
+            keep_alive: None,
+            timeout: None,
+            properties_builder: PropertiesBuilder::default(),
+            username: None,
+            password: None,
+            will: None,
+        }
     }
 }
 
