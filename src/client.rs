@@ -30,7 +30,7 @@ pub struct Client {
     will: Option<Will>,
 }
 
-pub struct ClientBuilder<'a> {
+pub struct MQTTOptions<'a> {
     address: &'a str,
     client_id: Option<MqttString>,
     keep_alive: Option<u16>,
@@ -59,8 +59,8 @@ pub struct Subscriber<'a> {
 }
 
 impl<'a> Client {
-    pub fn builder(address: &'a str) -> ClientBuilder {
-        ClientBuilder {
+    pub fn builder(address: &'a str) -> MQTTOptions {
+        MQTTOptions {
             address,
             client_id: None,
             keep_alive: None,
@@ -254,11 +254,11 @@ impl<'a> Client {
 
 impl fmt::Display for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.stream.get_ref().local_addr().unwrap())
+        write!(f, "{}", self.stream.get_ref().local_addr()?)
     }
 }
 
-impl ClientBuilder<'_> {
+impl MQTTOptions<'_> {
     pub fn client_id(mut self, value: &'static str) -> Self {
         self.client_id = Some(MqttString::from(value));
         self
@@ -309,7 +309,7 @@ impl ClientBuilder<'_> {
         self
     }
 
-    pub async fn build(self) -> Result<Client> {
+    pub async fn connect(self) -> Result<Client> {
         let peer: SocketAddr = self.address.parse()?;
         let socket = if peer.is_ipv4() {
             TcpSocket::new_v4()?
