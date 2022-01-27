@@ -8,7 +8,7 @@ use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::Duration;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use tracing::trace;
+use tracing::{trace};
 
 use crate::identifier::PacketIdentifier;
 use crate::v5::property::{PropertiesBuilder, SubscribeProperties};
@@ -43,12 +43,12 @@ pub struct MQTTOptions {
     pub clean_start: bool,
 }
 
-pub struct Publisher<'a> {
+pub struct Publisher {
     dup: bool,
     qos: QoS,
     retain: bool,
     properties_builder: PropertiesBuilder,
-    client: &'a mut Client,
+    client: Client,
 }
 
 pub struct Subscriber<'a> {
@@ -123,7 +123,7 @@ impl Client {
         self.stream.next().await.transpose().map_err(Error::msg)
     }
 
-    pub fn publisher(&mut self) -> Publisher {
+    pub fn publisher(self) -> Publisher {
         Publisher {
             dup: false,
             qos: QoS::AtMostOnce,
@@ -336,7 +336,7 @@ impl MQTTOptions {
     }
 }
 
-impl Publisher<'_> {
+impl Publisher {
     pub fn mark_dup(mut self) -> Self {
         self.dup = true;
         self
@@ -564,7 +564,12 @@ impl Publisher<'_> {
             unexpected => Err(anyhow!("unexpected: {}", unexpected)),
         })
     }
+
+    pub async fn disconnect(&mut self) -> Result<Option<ControlPacket>> {
+        self.client.disconnect_with_reason(ReasonCode::Success).await
+    }
 }
+
 
 impl Subscriber<'_> {
     pub fn qos(mut self, qos: QoS) -> Self {
