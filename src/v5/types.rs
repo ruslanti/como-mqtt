@@ -167,12 +167,13 @@ impl From<PacketType> for u8 {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ReasonCode {
     Success = 0x00,
     GrantedQoS1 = 0x01,
     GrantedQoS2 = 0x02,
     DisconnectWithWill = 0x04,
+    NoMatchingSubscribers = 0x10,
     NoSubscriptionExisted = 0x11,
     UnspecifiedError = 0x80,
     MalformedPacket = 0x81,
@@ -213,6 +214,7 @@ impl TryFrom<u8> for ReasonCode {
             0x01 => Ok(ReasonCode::GrantedQoS1),
             0x02 => Ok(ReasonCode::GrantedQoS2),
             0x04 => Ok(ReasonCode::DisconnectWithWill),
+            0x10 => Ok(ReasonCode::NoMatchingSubscribers),
             0x11 => Ok(ReasonCode::NoSubscriptionExisted),
             0x80 => Ok(ReasonCode::UnspecifiedError),
             0x81 => Ok(ReasonCode::MalformedPacket),
@@ -254,6 +256,7 @@ impl From<ReasonCode> for u8 {
             ReasonCode::GrantedQoS1 => 0x01,
             ReasonCode::GrantedQoS2 => 0x02,
             ReasonCode::DisconnectWithWill => 0x04,
+            ReasonCode::NoMatchingSubscribers => 0x10,
             ReasonCode::NoSubscriptionExisted => 0x11,
             ReasonCode::UnspecifiedError => 0x80,
             ReasonCode::MalformedPacket => 0x81,

@@ -21,6 +21,7 @@ use crate::v5::types::{
 pub struct Client {
     stream: Framed<TcpStream, MqttCodec>,
     client_id: Option<MqttString>,
+    clean_start: bool,
     keep_alive: u16,
     properties_builder: PropertiesBuilder,
     timeout: Option<Duration>,
@@ -39,6 +40,7 @@ pub struct MQTTOptions {
     username: Option<MqttString>,
     password: Option<Bytes>,
     will: Option<Will>,
+    pub clean_start: bool,
 }
 
 pub struct Publisher<'a> {
@@ -59,10 +61,10 @@ pub struct Subscriber<'a> {
 }
 
 impl Client {
-    pub async fn connect(&mut self, clean_start: bool) -> Result<ConnAck> {
+    pub async fn connect(&mut self) -> Result<ConnAck> {
         let connect = Connect {
             reserved: false,
-            clean_start_flag: clean_start,
+            clean_start_flag: self.clean_start,
             keep_alive: self.keep_alive,
             properties: self.properties_builder.to_owned().connect(),
             client_identifier: self.client_id.clone(),
@@ -71,25 +73,6 @@ impl Client {
             will: self.will.to_owned(),
         };
         trace!("send {:?}", connect);
-        self.stream.send(ControlPacket::Connect(connect)).await?;
-        self.recv().await.and_then(|packet| match packet {
-            ControlPacket::ConnAck(ack) => Ok(ack),
-            _ => Err(anyhow!("unexpected: {}", packet)),
-        })
-    }
-
-    pub async fn connect_reserved(&mut self, clean_start: bool) -> Result<ConnAck> {
-        let connect = Connect {
-            reserved: true,
-            clean_start_flag: clean_start,
-            keep_alive: self.keep_alive,
-            properties: self.properties_builder.to_owned().connect(),
-            client_identifier: self.client_id.clone(),
-            username: None,
-            password: None,
-            will: self.will.to_owned(),
-        };
-        trace!("send {}", connect);
         self.stream.send(ControlPacket::Connect(connect)).await?;
         self.recv().await.and_then(|packet| match packet {
             ControlPacket::ConnAck(ack) => Ok(ack),
@@ -256,6 +239,11 @@ impl MQTTOptions {
         self
     }
 
+    pub fn clean_start(mut self, value: bool) -> Self {
+        self.clean_start = value;
+        self
+    }
+
     pub fn session_expire_interval(mut self, value: u32) -> Self {
         self.properties_builder = self
             .properties_builder
@@ -313,9 +301,10 @@ impl MQTTOptions {
         let stream = socket.connect(self.address).await?;
         let stream = Framed::new(stream, MqttCodec::new(None));
 
-        Ok(Client {
+        let mut client = Client {
             stream,
             client_id: self.client_id,
+            clean_start: self.clean_start,
             keep_alive: self.keep_alive.unwrap_or(0),
             properties_builder: self.properties_builder,
             timeout: self.timeout,
@@ -323,11 +312,19 @@ impl MQTTOptions {
             username: self.username,
             password: self.password,
             will: self.will,
-        })
+        };
+
+        let ack = client.connect().await?;
+        if ack.reason_code != ReasonCode::Success {
+            bail!("Connect error: {:?}", ack.reason_code)
+        } else {
+            Ok(client)
+        }
     }
     pub fn new(address: SocketAddr) -> Self {
         MQTTOptions {
             address,
+            clean_start: true,
             client_id: None,
             keep_alive: None,
             timeout: None,
@@ -402,12 +399,8 @@ impl Publisher<'_> {
         self
     }
 
-    pub async fn publish(&mut self, topic_name: &str, payload: &'static [u8]) -> Result<u16> {
-        let packet_identifier = (self.qos != QoS::AtMostOnce)
-            .then(|| self.client.packet_identifier.next())
-            .flatten();
-
-
+    pub async fn publish(&mut self, topic_name: String, payload: Vec<u8>) ->
+                                                                                     Result<ReasonCode> {
         match self.qos {
             QoS::AtMostOnce => self.at_most_once_publish(topic_name, payload).await,
             QoS::AtLeastOnce => self.at_least_once_publish(topic_name, payload).await,
@@ -415,7 +408,8 @@ impl Publisher<'_> {
         }
     }
 
-    async fn at_most_once_publish(&mut self, topic_name: &str, payload: &'static [u8]) -> Result<u16> {
+    async fn at_most_once_publish(&mut self, topic_name: String, payload: Vec<u8>) ->
+                                                                                         Result<ReasonCode> {
         let msg = Publish {
             dup: self.dup,
             qos: self.qos,
@@ -427,10 +421,11 @@ impl Publisher<'_> {
         };
         trace!("send {}", msg);
         self.client.send(ControlPacket::Publish(msg)).await?;
-        Ok(0)
+        Ok(ReasonCode::Success)
     }
 
-    async fn at_least_once_publish(&mut self, topic_name: &str, payload: &'static [u8]) -> Result<u16> {
+    async fn at_least_once_publish(&mut self, topic_name: String, payload: Vec<u8>) ->
+                                                                                          Result<ReasonCode> {
         let mut dup = false;
         let mut retries = 3;
         let packet_identifier = self.client.packet_identifier.next();
@@ -452,78 +447,119 @@ impl Publisher<'_> {
 
             self.client.send(ControlPacket::Publish(msg)).await?;
 
-            match timeout(Duration::from_secs(3), self.ack()).await {
-                Ok(res) => break res.map(|ack| ack.packet_identifier),
-                Err(_) => {
+            match timeout(Duration::from_secs(3), self.recv_ack(packet_identifier.unwrap())).await {
+                Ok(res) => {
+                    return res.map(|res| res.reason_code)
+                },
+                Err(elapsed) => {
                     if retries > 0 {
                         retries = retries - 1;
                         dup = true;
                         continue;
                     } else {
-                        break bail!("elapsed")
+                        bail!("PUBACK error: {}", elapsed)
                     }
                 }
             }
         }
     }
 
-    async fn exactly_once_publish(&mut self, msg: Publish) -> Result<Option<u16>> {
-        trace!("send {}", publish);
-        self.client.send(ControlPacket::Publish(publish)).await?;
+    async fn exactly_once_publish(&mut self, topic_name: String, payload: Vec<u8>) ->
+                                                                                         Result<ReasonCode> {
+        let mut dup = false;
+        let mut retries = 3;
+        let packet_identifier = self.client.packet_identifier.next();
+        let topic_name =  MqttString::from(topic_name);
+        let properties = self.properties_builder.clone().publish();
+        let payload = Bytes::from(payload);
 
-        self.client.recv().await.and_then(|packet| match packet {
-            ControlPacket::PubRec(ack) => {
-                self.client
-                    .send(ControlPacket::PubRel(PublishResponse {
-                        packet_identifier,
-                        reason_code,
-                        properties: self.properties_builder.clone().pubres(),
-                    }))
-                    .await?;
-                self.client.recv().await.and_then(|packet| match packet {
-                    ControlPacket::PubComp(ack) => {
-                        self.client.packet_identifier.release(ack.packet_identifier);
-                        Ok(Some(ack.packet_identifier))
-                    }
-                    unexpected => Err(anyhow!("unexpected: {}", unexpected)),
-                })
-            }
-            unexpected => Err(anyhow!("unexpected: {}", unexpected)),
-        })
-    }
-
-    async fn ack(&mut self) -> Result<PublishResponse, Error> {
-        self.client.recv().await.and_then(|packet| match packet {
-            ControlPacket::PubAck(ack) => {
-                self.client.packet_identifier.release(ack.packet_identifier);
-                Ok(ack)
-            }
-            unexpected => Err(anyhow!("unexpected: {}", unexpected)),
-        })
-    }
-
-    async fn rec(&mut self) -> Result<PublishResponse, Error> {
-        self.client.recv().await.and_then(|packet| match packet {
-            ControlPacket::PubRec(ack) => Ok(ack),
-            unexpected => Err(anyhow!("unexpected: {}", unexpected)),
-        })
-    }
-
-    async fn rel(&mut self, packet_identifier: u16, reason_code: ReasonCode) -> Result<()> {
-        self.client
-            .send(ControlPacket::PubRel(PublishResponse {
+        loop {
+            let msg = Publish {
+                dup,
+                qos: self.qos,
+                retain: self.retain,
+                topic_name: topic_name.clone(),
                 packet_identifier,
-                reason_code,
-                properties: self.properties_builder.clone().pubres(),
-            }))
-            .await
+                properties: properties.clone(),
+                payload: payload.clone(),
+            };
+            trace!("send {}", msg);
+
+            self.client.send(ControlPacket::Publish(msg)).await?;
+
+            match timeout(Duration::from_secs(3), self.recv_rec(packet_identifier.unwrap())).await {
+                Ok(res) => {
+                    let res = res?;
+                    if res.reason_code != ReasonCode::Success {
+                        self.client.packet_identifier.release(res.packet_identifier);
+                        return Ok(res.reason_code)
+                    } else {
+                        return self.send_rel(packet_identifier.unwrap(), ReasonCode::Success).await
+                    }
+                },
+                Err(elapsed) => {
+                    if retries > 0 {
+                        retries = retries - 1;
+                        dup = true;
+                        continue;
+                    } else {
+                        bail!("PUBREC error: {}", elapsed)
+                    }
+                }
+            }
+        }
+
     }
 
-    async fn comp(&mut self) -> Result<PublishResponse, Error> {
+    async fn recv_ack(&mut self, packet_identifier: u16) -> Result<PublishResponse, Error> {
         self.client.recv().await.and_then(|packet| match packet {
-            ControlPacket::PubComp(ack) => {
-                self.client.packet_identifier.release(ack.packet_identifier);
-                Ok(ack)
+            ControlPacket::PubAck(res) if res.packet_identifier == packet_identifier => {
+                self.client.packet_identifier.release(res.packet_identifier);
+                Ok(res)
+            }
+            unexpected => bail!("unexpected: {}", unexpected),
+        })
+    }
+
+    async fn recv_rec(&mut self, packet_identifier: u16) -> Result<PublishResponse, Error> {
+        self.client.recv().await.and_then(|packet| match packet {
+            ControlPacket::PubRec(res)  if res.packet_identifier == packet_identifier  => Ok(res),
+            unexpected => bail!("unexpected: {}", unexpected),
+        })
+    }
+
+    async fn send_rel(&mut self, packet_identifier: u16, reason_code: ReasonCode) -> Result<ReasonCode> {
+        let mut retries = 3;
+        loop {
+            self.client
+                .send(ControlPacket::PubRel(PublishResponse {
+                    packet_identifier,
+                    reason_code,
+                    properties: self.properties_builder.clone().pubres(),
+                }))
+                .await?;
+
+            match timeout(Duration::from_secs(3), self.res_comp(packet_identifier)).await {
+                Ok(res) => {
+                    return res.map(|res| res.reason_code)
+                },
+                Err(elapsed) => {
+                    if retries > 0 {
+                        retries = retries - 1;
+                        continue;
+                    } else {
+                        bail!("PUBCOMP error: {}", elapsed)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn res_comp(&mut self, packet_identifier: u16) -> Result<PublishResponse, Error> {
+        self.client.recv().await.and_then(|packet| match packet {
+            ControlPacket::PubComp(res) if res.packet_identifier == packet_identifier => {
+                self.client.packet_identifier.release(res.packet_identifier);
+                Ok(res)
             }
             unexpected => Err(anyhow!("unexpected: {}", unexpected)),
         })

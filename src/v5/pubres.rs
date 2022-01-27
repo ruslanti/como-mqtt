@@ -16,13 +16,15 @@ impl TryFrom<Bytes> for PublishResponse {
     fn try_from(mut reader: Bytes) -> Result<Self, Self::Error> {
         end_of_stream!(reader.remaining() < 2, "pubres variable header");
         let packet_identifier = reader.get_u16();
-        let (reason_code, properties_length) = if reader.has_remaining() {
-            (
-                reader.get_u8().try_into()?,
-                decode_variable_integer(&mut reader)? as usize,
-            )
+        let reason_code = if reader.has_remaining() {
+            reader.get_u8().try_into()?
         } else {
-            (ReasonCode::Success, 0)
+            ReasonCode::Success
+        };
+        let properties_length = if reader.has_remaining() {
+            decode_variable_integer(&mut reader)? as usize
+        } else {
+            0
         };
         let properties = ResponseProperties::try_from(reader.slice(..properties_length))?;
 
